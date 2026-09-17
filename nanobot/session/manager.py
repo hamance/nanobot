@@ -482,6 +482,33 @@ class Session:
         self.updated_at = datetime.now()
         self.metadata.pop("_last_summary", None)
 
+# Placeholder swapped in for recalled (retracted) user messages so the
+# conversation structure survives while the original content is forgotten.
+REDACTED_MESSAGE_TEXT = "[message recalled]"
+
+
+def redact_message_in_session(session: Session, message_id: str) -> bool:
+    """Replace content of user messages tagged with a recalled channel message id.
+
+    History rows carry the originating channel ``message_id`` when the channel
+    provides one, so a chat recall event can surgically forget that message
+    without tearing a hole in the surrounding conversation.
+    """
+    redacted = False
+    for message in session.messages:
+        if message.get("role") != "user" or message.get("message_id") != message_id:
+            continue
+        if message.get("content") != REDACTED_MESSAGE_TEXT:
+            message["content"] = REDACTED_MESSAGE_TEXT
+            redacted = True
+        if message.get("media"):
+            message["media"] = []
+            redacted = True
+    if redacted:
+        session.updated_at = datetime.now()
+    return redacted
+
+
 class SessionPayload(TypedDict):
     key: str
     created_at: str | None

@@ -81,7 +81,12 @@ from nanobot.session.automation_turns import automation_history_overrides
 from nanobot.session.goal_state import goal_state_runtime_lines
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META
 from nanobot.session.keys import UNIFIED_SESSION_KEY, remember_last_channel
-from nanobot.session.manager import SESSION_CACHE_MAX_SIZE, Session, SessionManager
+from nanobot.session.manager import (
+    SESSION_CACHE_MAX_SIZE,
+    Session,
+    SessionManager,
+    redact_message_in_session,
+)
 from nanobot.session.model_selection import (
     SESSION_MODEL_PRESET_METADATA_KEY,
     model_preset_from_metadata,
@@ -397,6 +402,7 @@ class AgentLoop:
         self._running = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        self._turn_origin_message_ids: dict[str, str] = {}
         self._discarding_sessions: set[str] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._close_lock = asyncio.Lock()
@@ -696,6 +702,9 @@ class AgentLoop:
         has_text = isinstance(content_value, str) and content_value.strip()
         if has_text or media_paths or runtime_context_blocks:
             extra: dict[str, Any] = ({"media": list(media_paths)} if media_paths else {}) | agent_context.session_extra(msg.metadata)
+            message_id = msg.metadata.get("message_id")
+            if isinstance(message_id, str) and message_id:
+                extra["message_id"] = message_id
             extra.update(kwargs)
             text = content_value if isinstance(content_value, str) else ""
             text_override, automation_extra = automation_history_overrides(msg.metadata)
@@ -893,6 +902,41 @@ class AgentLoop:
         finally:
             self.discard_session_file_state(key)
             self._discarding_sessions.discard(key)
+
+    async def redact_session_message(self, key: str, message_id: str) -> bool:
+        """Forget a recalled message: cancel its in-flight turn and redact history.
+
+        The turn is only cancelled when it was triggered by the recalled
+        message itself; recalling older messages never aborts unrelated work.
+        Returns True when the message was found (and redacted) in the session.
+        """
+        if self._unified_session:
+            key = UNIFIED_SESSION_KEY
+        if self._turn_origin_message_ids.get(key) == message_id:
+            logger.info("Recalled message {} has an active turn; cancelling", message_id)
+            await self._cancel_active_tasks(key)
+        # Drop the recalled message from the pending queue when it is still
+        # waiting for mid-turn injection.
+        pending = self._pending_queues.get(key)
+        if pending is not None:
+            kept: list[InboundMessage] = []
+            while True:
+                try:
+                    item = pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item.metadata.get("message_id") != message_id:
+                    kept.append(item)
+            for item in kept:
+                pending.put_nowait(item)
+        session = self.sessions.get_cached(key)
+        if session is None:
+            return False
+        redacted = redact_message_in_session(session, message_id)
+        if redacted:
+            self.sessions.save(session)
+            logger.info("Recalled message {} redacted from session {}", message_id, key)
+        return redacted
 
     def discard_session_file_state(self, key: str) -> None:
         """Forget ephemeral file-read state for a reset or removed session."""
@@ -1374,6 +1418,12 @@ class AgentLoop:
                 # Compute the effective session key before dispatching
                 # This ensures /stop command can find tasks correctly when unified session is enabled
                 task = asyncio.create_task(self._dispatch(msg))
+                origin_message_id = msg.metadata.get("message_id")
+                if msg.is_user_input and isinstance(origin_message_id, str) and origin_message_id:
+                    self._turn_origin_message_ids[effective_key] = origin_message_id
+                    task.add_done_callback(
+                        lambda _task, key=effective_key: self._turn_origin_message_ids.pop(key, None)
+                    )
                 self._track_active_task(effective_key, task)
         finally:
             await self.aclose()

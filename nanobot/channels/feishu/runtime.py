@@ -25,12 +25,19 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import (
+    INBOUND_META_RUNTIME_CONTROL,
+    RUNTIME_CONTROL_REDACT_MESSAGE_ID,
+    RUNTIME_CONTROL_SESSION_REDACT,
+    InboundMessage,
+    OutboundMessage,
+)
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.contracts import ChannelInstanceSpec
 from nanobot.channels.feishu.config import FeishuConfig, feishu_default_config
+from nanobot.channels.feishu.docapi import register_doc_client, unregister_doc_client
 from nanobot.channels.feishu.instances import (
     DEFAULT_INSTANCE_ID,
     feishu_app_identity_key,
@@ -73,6 +80,135 @@ def _as_json_list(value: Any) -> list[Any] | None:
 
 def _ignore_event(_: Any) -> None:
     """Consume SDK events that intentionally have no channel action."""
+
+
+def _comment_reply_text(reply: dict[str, Any]) -> str | None:
+    """Extract human-readable text from one drive comment reply."""
+    content = _as_json_object(reply.get("content"))
+    elements = _as_json_list(content.get("elements")) if content else None
+    if not elements:
+        return None
+    parts: list[str] = []
+    for element in elements:
+        element = _as_json_object(element) or {}
+        text_run = _as_json_object(element.get("text_run"))
+        text = text_run.get("text") if text_run else None
+        if isinstance(text, str) and text:
+            parts.append(text)
+            continue
+        docs_link = _as_json_object(element.get("docs_link"))
+        link_text = docs_link.get("title") or docs_link.get("url") if docs_link else None
+        if isinstance(link_text, str) and link_text:
+            parts.append(link_text)
+    result = "".join(parts).strip()
+    return result or None
+
+
+def _comment_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize comment objects across get/list/batch_query response shapes."""
+    raw_items = _as_json_list(data.get("items")) or _as_json_list(data.get("comment_list")) or []
+    return [item for item in (_as_json_object(item) for item in raw_items) if item is not None]
+
+
+def _extract_comment_text(data: dict[str, Any], reply_id: str | None) -> str | None:
+    """Pull readable text out of a drive comment response body.
+
+    Prefers the reply matching ``reply_id`` from the event; otherwise joins
+    every reply in the comment thread.
+    """
+    replies: list[dict[str, Any]] = []
+    for comment in _comment_items(data):
+        reply_list = _as_json_object(comment.get("reply_list")) or {}
+        nested = _as_json_list(reply_list.get("replies"))
+        if nested:
+            replies.extend(r for r in nested if isinstance(r, dict))
+    if reply_id:
+        for reply in replies:
+            if reply.get("reply_id") == reply_id:
+                return _comment_reply_text(reply)
+    texts = [text for text in (_comment_reply_text(r) for r in replies) if text]
+    return "\n".join(texts) if texts else None
+
+
+def _extract_comment_quote(data: dict[str, Any]) -> str | None:
+    """Return the quoted (anchored) document text a comment attaches to."""
+    for comment in _comment_items(data):
+        quote = comment.get("quote")
+        if isinstance(quote, str) and quote.strip():
+            return quote.strip()
+    return None
+
+
+def _coerce_json_object(value: Any) -> dict[str, Any] | None:
+    """Parse a value that is either a JSON object or a JSON-encoded string."""
+    parsed = _as_json_object(value)
+    if parsed is not None:
+        return parsed
+    if isinstance(value, str) and value.strip():
+        try:
+            return _as_json_object(json.loads(value))
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def _extract_comment_block_id(data: dict[str, Any]) -> str | None:
+    """Return the docx block id a comment is anchored to.
+
+    Returned only when comments were queried with ``need_relation=true`` and
+    only for docx documents. The ``relation`` payload is a nested JSON string
+    in some API shapes (``relation`` -> ``relation`` -> positionInfo), so each
+    layer is parsed defensively; field naming is camelCase or snake_case.
+    """
+
+    def _block_id_in(relation: Any, depth: int = 0) -> str | None:
+        relation_obj = _coerce_json_object(relation)
+        if relation_obj is None:
+            return None
+        position = (
+            _as_json_object(relation_obj.get("positionInfo"))
+            or _as_json_object(relation_obj.get("position_info"))
+        )
+        if position is not None:
+            block_id = position.get("blockID") or position.get("block_id")
+            if isinstance(block_id, str) and block_id:
+                return block_id
+        if depth < 3 and "relation" in relation_obj:
+            nested = _block_id_in(relation_obj.get("relation"), depth + 1)
+            if nested:
+                return nested
+        return None
+
+    top_level = _block_id_in(data.get("relation"))
+    if top_level:
+        return top_level
+    for comment in _comment_items(data):
+        block_id = _block_id_in(comment.get("relation"))
+        if block_id:
+            return block_id
+    return None
+
+
+def _extract_block_text(block: dict[str, Any]) -> str | None:
+    """Collect all text_run contents from a docx block of any text-bearing type."""
+    parts: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            text_run = _as_json_object(node.get("text_run"))
+            if text_run is not None:
+                content = text_run.get("content")
+                if isinstance(content, str) and content:
+                    parts.append(content)
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(block)
+    text = "".join(parts).strip()
+    return text or None
 
 
 def _load_lark_runtime() -> tuple[Any, str, str]:
@@ -991,6 +1127,9 @@ class FeishuChannel(BaseChannel):
         self._ws_client: Any = None
         self._ws_runner = get_feishu_ws_runner()
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._processed_comment_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._recall_index: OrderedDict[str, str] = OrderedDict()  # message_id -> session key
+        self._recalled_message_ids: set[str] = set()  # recalls that raced ahead of the message
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._bot_open_id: str | None = None
@@ -1098,6 +1237,7 @@ class FeishuChannel(BaseChannel):
             .log_level(lark.LogLevel.INFO)
             .build()
         )
+        register_doc_client(self.name, self._client)
         builder = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
             self.config.verification_token or "",
@@ -1115,6 +1255,16 @@ class FeishuChannel(BaseChannel):
             builder,
             "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
             self._on_bot_p2p_chat_entered,
+        )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_message_recalled_v1",
+            self._on_message_recall_sync,
+        )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_drive_notice_comment_add_v1",
+            self._on_doc_comment_sync if self.config.doc_comment_enabled else _ignore_event,
         )
         # Silence "processor not found" errors when bots are added/removed from groups.
         # These events carry no actionable data for the agent.
@@ -1166,6 +1316,7 @@ class FeishuChannel(BaseChannel):
         Reference: https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/ws/client.py#L86
         """
         self._running = False
+        unregister_doc_client(self.name)
         await self._ws_runner.stop_client(self.name)
         self.logger.info("bot stopped")
 
@@ -1313,9 +1464,15 @@ class FeishuChannel(BaseChannel):
             response = self._client.im.v1.message_reaction.create(request)
 
             if not response.success():
-                self.logger.warning(
-                    "Failed to add reaction: code={}, msg={}", response.code, response.msg
-                )
+                if response.code == 231003:
+                    # Message deleted/recalled before the reaction landed — expected.
+                    self.logger.debug(
+                        "Skipping reaction for recalled/deleted message {}", message_id
+                    )
+                else:
+                    self.logger.warning(
+                        "Failed to add reaction: code={}, msg={}", response.code, response.msg
+                    )
                 return None
             else:
                 self.logger.debug("Added {} reaction to message {}", emoji_type, message_id)
@@ -1334,6 +1491,9 @@ class FeishuChannel(BaseChannel):
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
         """
         if not self._client:
+            return None
+        if message_id in self._recalled_message_ids:
+            self.logger.debug("Skipping reaction for recalled message {}", message_id)
             return None
 
         loop = asyncio.get_running_loop()
@@ -2675,6 +2835,11 @@ class FeishuChannel(BaseChannel):
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
 
+            # A recall event raced ahead of the message event — drop it.
+            if message_id in self._recalled_message_ids:
+                self._recalled_message_ids.discard(message_id)
+                return
+
             # Early permission check — avoid side effects for unauthorized users.
             # Group chats are silently ignored; DMs get a pairing code.
             if not self.is_allowed(sender_id):
@@ -2806,6 +2971,12 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            # Remember which session this message belongs to so a later
+            # im.message.recalled_v1 can find and forget it.
+            effective_session_key = session_key or f"{self.name}:{reply_to}"
+            self._recall_index[message_id] = effective_session_key
+            while len(self._recall_index) > 1000:
+                self._recall_index.popitem(last=False)
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -2825,6 +2996,216 @@ class FeishuChannel(BaseChannel):
 
         except Exception:
             self.logger.exception("Error processing message")
+
+    def _on_message_recall_sync(self, data: Any) -> None:
+        """
+        Sync handler for message recall events (called from WebSocket thread).
+        Schedules async handling in the main event loop.
+        """
+        if not self._running:
+            return
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._on_message_recall(data), self._loop)
+
+    async def _on_message_recall(self, data: Any) -> None:
+        """Handle im.message.recalled_v1 events.
+
+        Recalls for messages the bot never processed (other chat members,
+        messages from before startup) are ignored. For known messages, a
+        runtime-control message tells the agent loop to cancel the in-flight
+        turn when the recall triggered it, and to redact the message from
+        session history. Bot replies are not retracted.
+        """
+        if not self._running:
+            return
+        try:
+            event = getattr(data, "event", None)
+            message_id = getattr(event, "message_id", None)
+            if not isinstance(message_id, str) or not message_id:
+                self.logger.warning("Ignoring Feishu recall event with missing message id")
+                return
+            # Remember the recall even when the message is unknown: it may
+            # still be working through the inbound pipeline behind this event.
+            self._recalled_message_ids.add(message_id)
+            while len(self._recalled_message_ids) > 1000:
+                self._recalled_message_ids.pop()
+            session_key = self._recall_index.pop(message_id, None)
+            if session_key is None:
+                self.logger.debug("Ignoring recall for unknown message {}", message_id)
+                return
+            self.logger.info(
+                "Message {} recalled in session {}; redacting it from the conversation",
+                message_id,
+                session_key,
+            )
+            await self.bus.publish_inbound(
+                InboundMessage(
+                    channel="system",
+                    sender_id="system",
+                    chat_id=session_key,
+                    content="",
+                    metadata={
+                        INBOUND_META_RUNTIME_CONTROL: RUNTIME_CONTROL_SESSION_REDACT,
+                        RUNTIME_CONTROL_REDACT_MESSAGE_ID: message_id,
+                    },
+                    session_key_override=session_key,
+                )
+            )
+        except Exception:
+            self.logger.exception("Error processing message recall event")
+
+    def _on_doc_comment_sync(self, data: Any) -> None:
+        """
+        Sync handler for drive comment events (called from WebSocket thread).
+        Schedules async handling in the main event loop.
+        """
+        if not self._running:
+            return
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._on_doc_comment(data), self._loop)
+
+    async def _on_doc_comment(self, data: Any) -> None:
+        """Handle drive.notice.comment_add_v1 events.
+
+        Only fires the agent when the comment @-mentions the bot (if
+        ``doc_comment_mention_only``) and the commenter is in
+        ``doc_comment_from_users`` (when that list is non-empty). The agent's
+        normal reply goes to the commenter's DM; thread replies and doc edits
+        happen through the feishu_doc_* tools. One isolated session per document.
+        """
+        if not self._running:
+            return
+        try:
+            event = getattr(data, "event", None)
+            if event is None:
+                self.logger.warning("Ignoring incomplete Feishu doc comment event")
+                return
+            if self.config.doc_comment_mention_only and not getattr(event, "is_mentioned", None):
+                self.logger.debug("skipping doc comment (bot not mentioned)")
+                return
+            meta = getattr(event, "notice_meta", None)
+            from_user = getattr(meta, "from_user_id", None) if meta is not None else None
+            sender_id = getattr(from_user, "open_id", None) if from_user is not None else None
+            file_token = getattr(meta, "file_token", None) if meta is not None else None
+            comment_id = getattr(event, "comment_id", None)
+            reply_id = getattr(event, "reply_id", None)
+            reply_id = reply_id if isinstance(reply_id, str) else None
+            if not all(isinstance(value, str) and value for value in (sender_id, file_token, comment_id)):
+                self.logger.warning("Ignoring Feishu doc comment event with missing routing fields")
+                return
+            sender_id = cast(str, sender_id)
+            file_token = cast(str, file_token)
+            comment_id = cast(str, comment_id)
+            if self.config.doc_comment_from_users and sender_id not in self.config.doc_comment_from_users:
+                self.logger.debug("skipping doc comment (sender {} not in doc_comment_from_users)", sender_id)
+                return
+            if not self.is_allowed(sender_id):
+                self.logger.warning("Access denied for doc comment sender {}", sender_id)
+                return
+
+            # Deduplication check
+            dedup_key = f"{file_token}:{comment_id}:{reply_id or ''}"
+            if dedup_key in self._processed_comment_ids:
+                return
+            self._processed_comment_ids[dedup_key] = None
+            while len(self._processed_comment_ids) > 500:
+                self._processed_comment_ids.popitem(last=False)
+
+            file_type = getattr(meta, "file_type", None)
+            file_type = file_type if isinstance(file_type, str) else ""
+
+            # The event payload carries no comment text or anchor — fetch them.
+            # docx comments are batch-queried with need_relation so the
+            # response includes the anchor block id; other file types only
+            # expose the quoted text.
+            loop = asyncio.get_running_loop()
+            body = await loop.run_in_executor(
+                None, self._fetch_doc_comment_sync, file_token, comment_id, file_type
+            ) or {}
+            comment_text = _extract_comment_text(body, reply_id)
+            comment_quote = _extract_comment_quote(body)
+            block_id = _extract_comment_block_id(body)
+            block_type: int | None = None
+            block_text = None
+            if block_id and file_type == "docx":
+                block = await loop.run_in_executor(
+                    None, self._fetch_doc_block_sync, file_token, block_id
+                )
+                if block is not None:
+                    block_type_obj = block.get("block_type")
+                    if isinstance(block_type_obj, int):
+                        block_type = block_type_obj
+                    block_text = _extract_block_text(block)
+
+            content_lines = [
+                "[Feishu doc comment]",
+                f"Document type: {file_type or 'unknown'}, file token: {file_token}",
+            ]
+            if comment_quote:
+                content_lines.append(f"Quoted text: {comment_quote}")
+            if block_id:
+                anchor = f"Comment anchor block: {block_id}"
+                if block_type is not None:
+                    anchor += f" (type {block_type})"
+                content_lines.append(anchor)
+            if block_text:
+                content_lines.append(f"Block content: {block_text}")
+            content_lines.append(f"Comment by {sender_id}:")
+            if comment_text:
+                content_lines.append(comment_text)
+            else:
+                content_lines.append(
+                    f"(comment {comment_id}, reply {reply_id or 'n/a'} — content unavailable)"
+                )
+            content_lines.append(
+                "Actions: edit the quoted block with feishu_docx_update_block "
+                "(file token + Comment anchor block id; inspect it first with "
+                "feishu_docx_get_block), answer in the thread with "
+                "feishu_doc_comment_reply, mark handled with feishu_doc_comment_resolve."
+            )
+
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=sender_id,
+                content="\n".join(content_lines),
+                metadata={
+                    "event_type": "drive.notice.comment_add_v1",
+                    "file_token": file_token,
+                    "file_type": file_type,
+                    "comment_id": comment_id,
+                    "reply_id": reply_id,
+                    "block_id": block_id,
+                    "block_type": block_type,
+                },
+                session_key=f"{self.name}:doc:{file_token}",
+                is_dm=True,
+            )
+        except Exception:
+            self.logger.exception("Error processing doc comment event")
+
+    def _fetch_doc_comment_sync(
+        self,
+        file_token: str,
+        comment_id: str,
+        file_type: str = "",
+    ) -> dict[str, Any] | None:
+        """Fetch the comment thread, requesting anchor relation for docx files."""
+        from nanobot.channels.feishu import docapi
+
+        if file_type == "docx":
+            return docapi.batch_query_comments(
+                self._client, file_token, comment_id, file_type=file_type
+            )
+        return docapi.get_comment(self._client, file_token, comment_id, file_type=file_type)
+
+    def _fetch_doc_block_sync(self, file_token: str, block_id: str) -> dict[str, Any] | None:
+        """Fetch one docx block and unwrap the ``data.block`` envelope."""
+        from nanobot.channels.feishu import docapi
+
+        data = docapi.fetch_block(self._client, file_token, block_id)
+        if data is None:
+            return None
+        return _as_json_object(data.get("block")) or data
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""

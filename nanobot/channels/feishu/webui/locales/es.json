@@ -69,6 +69,24 @@
           "true": "encendido",
           "false": "Apagado"
         }
+      },
+      "docCommentEnabled": {
+        "label": "Doc comments",
+        "choices": {
+          "true": "On",
+          "false": "Off"
+        }
+      },
+      "docCommentMentionOnly": {
+        "label": "Only when @-mentioned",
+        "choices": {
+          "true": "On",
+          "false": "Off"
+        }
+      },
+      "docCommentFromUsers": {
+        "label": "Doc comment allowlist",
+        "placeholder": "User IDs, comma separated"
       }
     }
   },

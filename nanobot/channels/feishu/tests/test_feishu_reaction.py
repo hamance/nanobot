@@ -52,6 +52,14 @@ class TestAddReactionSync:
         ch._client.im.v1.message_reaction.create.return_value = _mock_reaction_create_response(success=False)
         assert ch._add_reaction_sync("om_001", "THUMBSUP") is None
 
+    def test_returns_none_when_message_was_recalled(self):
+        ch = _make_channel()
+        resp = _mock_reaction_create_response(success=False)
+        resp.code = 231003
+        resp.msg = "The message is not found, maybe not exist or deleted"
+        ch._client.im.v1.message_reaction.create.return_value = resp
+        assert ch._add_reaction_sync("om_001", "THUMBSUP") is None
+
     def test_returns_none_when_response_data_is_none(self):
         ch = _make_channel()
         resp = MagicMock()

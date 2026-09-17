@@ -70,6 +70,24 @@
           "true": "开启",
           "false": "关闭"
         }
+      },
+      "docCommentEnabled": {
+        "label": "文档评论",
+        "choices": {
+          "true": "开",
+          "false": "关"
+        }
+      },
+      "docCommentMentionOnly": {
+        "label": "仅在被 @ 提及时触发",
+        "choices": {
+          "true": "开",
+          "false": "关"
+        }
+      },
+      "docCommentFromUsers": {
+        "label": "文档评论用户白名单",
+        "placeholder": "用户 ID，逗号分隔"
       }
     }
   },

@@ -16,7 +16,9 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.cli import utils as cli_app_utils
 from nanobot.bus.events import (
     INBOUND_META_RUNTIME_CONTROL,
+    RUNTIME_CONTROL_REDACT_MESSAGE_ID,
     RUNTIME_CONTROL_SESSION_DISCARD,
+    RUNTIME_CONTROL_SESSION_REDACT,
     InboundMessage,
 )
 from nanobot.runtime_context import (
@@ -44,6 +46,11 @@ def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
 async def handle_runtime_control(state: Any, msg: InboundMessage, tools: ToolRegistry) -> bool:
     if msg.metadata.get(INBOUND_META_RUNTIME_CONTROL) == RUNTIME_CONTROL_SESSION_DISCARD:
         await state.discard_session(msg.session_key)
+        return True
+    if msg.metadata.get(INBOUND_META_RUNTIME_CONTROL) == RUNTIME_CONTROL_SESSION_REDACT:
+        message_id = msg.metadata.get(RUNTIME_CONTROL_REDACT_MESSAGE_ID)
+        if isinstance(message_id, str) and message_id:
+            await state.redact_session_message(msg.session_key, message_id)
         return True
     return await image_generation_tools.handle_runtime_control(state, msg, tools)
 

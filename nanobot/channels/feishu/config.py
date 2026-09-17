@@ -27,6 +27,9 @@ class FeishuConfig(Base):
     streaming: bool = True
     domain: Literal["feishu", "lark"] = "feishu"
     topic_isolation: bool = True
+    doc_comment_enabled: bool = False
+    doc_comment_mention_only: bool = True
+    doc_comment_from_users: list[str] = Field(default_factory=list)
 
 
 def feishu_default_config() -> dict[str, object]:

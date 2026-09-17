@@ -19,6 +19,9 @@ INBOUND_META_USER_SHELL = "_user_shell"
 RUNTIME_CONTROL_ACK = "_ack"
 RUNTIME_CONTROL_IMAGE_GENERATION_RELOAD = "image_generation_reload"
 RUNTIME_CONTROL_SESSION_DISCARD = "session_discard"
+RUNTIME_CONTROL_SESSION_REDACT = "session_redact"
+# Recall payloads carry the recalled channel message id under this metadata key.
+RUNTIME_CONTROL_REDACT_MESSAGE_ID = "_redact_message_id"
 
 
 @dataclass
