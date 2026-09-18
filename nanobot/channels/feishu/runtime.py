@@ -1097,6 +1097,12 @@ class FeishuChannel(BaseChannel):
     name = "feishu"
     display_name = "Feishu"
 
+    # Compaction notices are routine maintenance (and fire on every pressured
+    # turn, including cron/heartbeat). Feishu is a mobile IM with no in-place
+    # message editing for this flow, so stay quiet unless explicitly enabled
+    # via channels.feishu.sendCompaction.
+    send_compaction = False
+
     _STREAM_EDIT_INTERVAL = 0.5  # throttle between CardKit streaming updates
 
     @classmethod

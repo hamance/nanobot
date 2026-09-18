@@ -352,6 +352,7 @@ class TestProgressFiltering:
         assert manager._resolve_bool_override({"send_progress": False}, "send_progress", True) is False
         assert manager._resolve_bool_override({"sendProgress": False}, "send_progress", True) is False
         assert manager._resolve_bool_override({"send_progress": "false"}, "send_progress", True) is True
+        assert manager._resolve_bool_override({"sendCompaction": False}, "send_compaction", True) is False
 
     def test_resolve_bool_override_model(self, manager):
         class FakeSection:

@@ -5,6 +5,9 @@ the outcome of a compaction are information for the user, not progress
 chatter: a channel with ``send_progress`` off still receives them. Reducing
 the noise (one message updated in place) is the adapter's job; see the
 Discord channel (#5719).
+
+A channel can mute compaction notices entirely with ``sendCompaction: false``
+in its config section.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import (
     ContextCompactionEvent,
     ProgressEvent,
@@ -41,6 +45,12 @@ class _MockChannel(BaseChannel):
 
     async def send(self, msg):
         return await self._send_mock(msg)
+
+
+class _QuietByDefaultChannel(_MockChannel):
+    """Channel class that opts out of compaction notices by default."""
+
+    send_compaction = False
 
 
 @pytest.fixture
@@ -87,3 +97,56 @@ async def test_compaction_lifecycle_is_delivered_with_progress_off(manager: Chan
     contents = _sent_contents(manager)
     assert "ordinary progress" not in contents
     assert len(contents) == 2
+
+
+@pytest.mark.asyncio
+async def test_compaction_notices_can_be_muted_per_channel(manager: ChannelManager) -> None:
+    manager.channels["mock"].send_compaction = False
+    for event in (
+        ContextCompactionEvent(compaction_id="c1", phase="started"),
+        ContextCompactionEvent(compaction_id="c1", phase="succeeded"),
+    ):
+        await manager.bus.publish_outbound(
+            outbound_message_for_event(channel="mock", chat_id="chat", event=event)
+        )
+    await manager.bus.publish_outbound(
+        OutboundMessage(channel="mock", chat_id="chat", content="hello")
+    )
+
+    await _dispatch_until(manager, 1)
+
+    assert _sent_contents(manager) == ["hello"]
+
+
+def test_build_channel_resolves_send_compaction_override() -> None:
+    config = Config.model_validate({"channels": {"sendCompaction": False}})
+    mgr = ChannelManager(config, MessageBus())
+
+    inherited = mgr._build_channel("mock", _MockChannel, {"enabled": True})
+    opted_in = mgr._build_channel(
+        "mock", _MockChannel, {"enabled": True, "sendCompaction": True}
+    )
+
+    assert inherited.send_compaction is False
+    assert opted_in.send_compaction is True
+
+
+def test_build_channel_honors_channel_class_default() -> None:
+    config = Config.model_validate({"channels": {"websocket": {"enabled": False}}})
+    mgr = ChannelManager(config, MessageBus())
+
+    quiet = mgr._build_channel("mock", _QuietByDefaultChannel, {"enabled": True})
+    assert quiet.send_compaction is False
+
+    # An explicit per-channel opt-in overrides the class default.
+    explicit = mgr._build_channel(
+        "mock", _QuietByDefaultChannel, {"enabled": True, "sendCompaction": True}
+    )
+    assert explicit.send_compaction is True
+
+    # A global opt-out cannot be loosened by a class default of True.
+    global_off = Config.model_validate(
+        {"channels": {"sendCompaction": False, "websocket": {"enabled": False}}}
+    )
+    mgr_off = ChannelManager(global_off, MessageBus())
+    assert mgr_off._build_channel("mock", _MockChannel, {"enabled": True}).send_compaction is False

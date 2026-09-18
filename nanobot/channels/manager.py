@@ -15,6 +15,7 @@ from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.outbound_events import (
+    ContextCompactionEvent,
     ProgressEvent,
     RetryWaitEvent,
     RuntimeModelUpdatedEvent,
@@ -67,6 +68,7 @@ ORIGIN_REPLY_FINGERPRINTS_MAX_SIZE = 1000
 _BOOL_CAMEL_ALIASES: dict[str, str] = {
     "send_progress": "sendProgress",
     "send_tool_hints": "sendToolHints",
+    "send_compaction": "sendCompaction",
     "show_reasoning": "showReasoning",
 }
 
@@ -228,6 +230,14 @@ class ChannelManager:
         )
         channel.show_reasoning = self._resolve_bool_override(
             section, "show_reasoning", self.config.channels.show_reasoning,
+        )
+        # A channel class may opt out by default (e.g. mobile IMs); the global
+        # switch and explicit per-channel overrides still win.
+        compaction_default = (
+            self.config.channels.send_compaction and channel.send_compaction
+        )
+        channel.send_compaction = self._resolve_bool_override(
+            section, "send_compaction", compaction_default,
         )
         return channel
 
@@ -829,6 +839,13 @@ class ChannelManager:
 
                 channel = self.channels.get(msg.channel)
                 if channel:
+                    # Context-compaction notices are routine maintenance; a
+                    # channel can mute them with ``sendCompaction: false``.
+                    if (
+                        isinstance(event, ContextCompactionEvent)
+                        and not channel.send_compaction
+                    ):
+                        continue
                     # Duplicate suppression is scoped to a known source message
                     # so repeated content from separate turns is still delivered.
                     if (
